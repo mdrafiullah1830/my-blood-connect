@@ -24,6 +24,12 @@ const bloodRequestSchema = new mongoose.Schema({
     },
     responses: { type: [responseSchema], default: [] },
     status: { type: String, enum: ['pending', 'fulfilled', 'cancelled'], default: 'pending' },
+    priority: { type: String, enum: ['normal', 'high', 'critical'], default: 'normal' },
+    shareToken: { type: String, default: '', index: true },
+    escalationLevel: { type: Number, min: 0, max: 3, default: 0 },
+    escalatedAt: { type: Date, default: null },
+    broadcastAt: { type: Date, default: null },
+    reminderSentAt: { type: Date, default: null },
     postedAt: { type: Date, default: Date.now }
 });
 

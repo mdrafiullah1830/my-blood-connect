@@ -25,6 +25,9 @@ const validateOrigin = createOriginValidator(process.env.FRONTEND_URL);
 app.disable('x-powered-by');
 app.use(cors({ origin: validateOrigin, credentials: false }));
 app.use(express.json({ limit: '1mb' }));
+// express 5 e body-less request e req.body undefined thake — destructure na bhenge
+// shob endpoint e empty object ensure kora hoy.
+app.use((req, _res, next) => { if (req.body === undefined || req.body === null) req.body = {}; next(); });
 
 // login ar register endpoint e brute-force attack theke safeguard rakhar jonno rate limiter use kora hoy.
 // choto somoy er moddhe onek request asle app-ke safe rakhte ei limiter kaj kore.
@@ -74,6 +77,14 @@ app.use('/api/auth', require('./routes/authRoutes'));
 app.use('/api/donors', require('./routes/donorRoutes'));
 app.use('/api/requests', require('./routes/requestRoutes'));
 app.use('/api/locations', require('./routes/locationRoutes'));
+app.use('/api/notifications', require('./routes/notificationRoutes'));
+app.use('/api/chat', require('./routes/chatRoutes'));
+app.use('/api/favorites', require('./routes/favoriteRoutes'));
+app.use('/api/donations', require('./routes/donationRoutes'));
+app.use('/api/banks', require('./routes/bloodBankRoutes'));
+app.use('/api/analytics', require('./routes/analyticsRoutes'));
+app.use('/api/admin', require('./routes/adminRoutes'));
+app.use('/api/map', require('./routes/mapRoutes'));
 
 app.use((req, res) => res.status(404).json({ success: false, message: 'Route not found' }));
 app.use((error, req, res, next) => {
@@ -87,7 +98,18 @@ const PORT = Number(process.env.PORT) || 5000;
 const startServer = async () => {
     await connectDB();
     await User.migrateToUnifiedAccounts();
+    await seedAdmin();
     server.listen(PORT, () => console.log(`Blood Connect API running on port ${PORT}`));
+    // background scheduler: escalation, reminders, eligibility alerts, daily digest.
+    require('./services/scheduler').startScheduler(io);
+};
+
+// ADMIN_EMAILS env e comma diye dile shei email gulo admin role paye.
+const seedAdmin = async () => {
+    const emails = String(process.env.ADMIN_EMAILS || '').split(',').map((e) => e.toLowerCase().trim()).filter(Boolean);
+    if (!emails.length) return;
+    await User.updateMany({ email: { $in: emails } }, { $set: { role: 'admin' } });
+    console.log(`Admin role ensured for ${emails.length} email(s)`);
 };
 
 if (require.main === module) {

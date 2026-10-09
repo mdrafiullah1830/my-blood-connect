@@ -1,6 +1,9 @@
 const mongoose = require('mongoose');
+const crypto = require('crypto');
 const BloodRequest = require('../models/BloodRequest');
 const User = require('../models/User');
+const { notify, notifyMany } = require('../services/notify');
+const { escalateRequest } = require('../services/scheduler');
 
 const cutoffDate = () => new Date(Date.now() - 90 * 24 * 60 * 60 * 1000);
 const BLOOD_GROUPS = ['A+', 'A-', 'B+', 'B-', 'AB+', 'AB-', 'O+', 'O-'];
@@ -27,13 +30,22 @@ const notifyDonors = (io, donorIds, request) => {
     if (!io) return;
     donorIds.forEach((id) => io.to(`user:${id}`).emit('blood_request_received', request));
     io.emit('blood_request_changed', { type: 'created', requestId: request._id });
+    // in-app notification history + push er jonno notify service call.
+    donorIds.forEach((id) => {
+        notify(io, id, {
+            type: 'request',
+            title: `Blood request: ${request.bloodGroup} needed`,
+            message: `${request.bagsRequired} bag(s) needed at ${request.hospitalName}.`,
+            link: '/requests'
+        }).catch(() => {});
+    });
 };
 
 // emergency blood request create korar somoy ei controller use kora hoy.
 // request validation, matching donor identify, ar realtime notification system e request send korar kaj ei kothay hoy.
 const createBloodRequest = async (req, res) => {
     try {
-        const { patientName, bloodGroup, hospitalName, hospitalAddress, contactNumber, bagsRequired, neededTime, targetDonorIds = [], requestType, latitude, longitude } = req.body;
+        const { patientName, bloodGroup, hospitalName, hospitalAddress, contactNumber, bagsRequired, neededTime, targetDonorIds = [], requestType, latitude, longitude, priority = 'normal' } = req.body;
         if (!patientName || !bloodGroup || !hospitalName || !hospitalAddress || !contactNumber || !neededTime) {
             return res.status(400).json({ success: false, message: 'All required blood request fields must be provided' });
         }
@@ -43,6 +55,7 @@ const createBloodRequest = async (req, res) => {
         if (deadline <= new Date()) return res.status(400).json({ success: false, message: 'Needed date/time must be in the future' });
         const bags = Number(bagsRequired || 1);
         if (!Number.isInteger(bags) || bags < 1 || bags > 20) return res.status(400).json({ success: false, message: 'Bags required must be between 1 and 20' });
+        if (!['normal', 'high', 'critical'].includes(priority)) return res.status(400).json({ success: false, message: 'Priority must be normal, high or critical' });
 
         let donorIds = Array.isArray(targetDonorIds) ? [...new Set(targetDonorIds.filter((id) => mongoose.isValidObjectId(id)).map(String))] : [];
         donorIds = donorIds.filter((id) => id !== req.user.id.toString());
@@ -78,6 +91,8 @@ const createBloodRequest = async (req, res) => {
             contactNumber: String(contactNumber).trim(),
             bagsRequired: bags,
             neededTime: deadline,
+            priority,
+            shareToken: crypto.randomBytes(8).toString('hex'),
             responses
         };
         if (coordinates) requestData.recipientLocation = { type: 'Point', coordinates };
@@ -102,7 +117,7 @@ const getAllRequests = async (req, res) => {
             .select('-contactNumber -recipientLocation')
             .populate('recipientId', 'name city division district thana')
             .populate('responses.donorId', 'name bloodGroup city')
-            .sort({ postedAt: -1 });
+            .sort({ priority: -1, postedAt: -1 });
         res.json({ success: true, total: requests.length, requests });
     } catch (error) {
         return fail(res, 'Request board read failed', error);
@@ -317,4 +332,80 @@ const deleteRequest = async (req, res) => {
     }
 };
 
-module.exports = { createBloodRequest, getAllRequests, getMyRequests, getMyEmergencyRequests, getMyDirectRequests, getIncomingDirectRequests, getIncomingEmergencyRequests, respondToRequest, cancelRequest, updateRequest, deleteRequest, validCoordinates };
+// share link theke public view — contact number hide kore basic info dekhay (WhatsApp/share feature).
+const getSharedRequest = async (req, res) => {
+    try {
+        const request = await BloodRequest.findOne({ shareToken: req.params.token, status: { $ne: 'cancelled' } })
+            .select('patientName bloodGroup hospitalName hospitalAddress bagsRequired neededTime status priority requestType postedAt')
+            .lean();
+        if (!request) return res.status(404).json({ success: false, message: 'Share link not found or expired' });
+        res.json({ success: true, request, shareUrl: `${process.env.FRONTEND_URL || 'http://localhost:5173'}/share/${req.params.token}` });
+    } catch (error) {
+        return fail(res, 'Shared request read failed', error);
+    }
+};
+
+// emergency broadcast — sohoi city/area er shob compatible available donor-ke ek sathe notify kore.
+const broadcastRequest = async (req, res) => {
+    try {
+        if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ success: false, message: 'Invalid request id' });
+        const request = await BloodRequest.findOne({ _id: req.params.id, recipientId: req.user.id });
+        if (!request) return res.status(404).json({ success: false, message: 'Request not found' });
+        if (request.status !== 'pending') return res.status(400).json({ success: false, message: 'Only pending requests can be broadcast' });
+
+        const alreadyTargeted = request.responses.map((r) => String(r.donorId));
+        const recipient = await User.findById(request.recipientId).select('district city division').lean();
+        const areaFilter = request.priority === 'critical' ? {} : {
+            $or: [
+                ...(recipient?.district ? [{ district: recipient.district }] : []),
+                ...(recipient?.city ? [{ city: recipient.city }] : []),
+                ...(recipient?.division ? [{ division: recipient.division }] : [])
+            ]
+        };
+        const donors = await User.find({
+            bloodGroup: request.bloodGroup,
+            isAvailable: true,
+            _id: { $nin: alreadyTargeted, $ne: req.user.id },
+            ...(Object.keys(areaFilter).length ? areaFilter : {})
+        }).select('_id').lean();
+        const donorIds = donors.map((d) => String(d._id));
+        if (!donorIds.length) return res.status(404).json({ success: false, message: 'No additional available donors to broadcast to' });
+
+        await BloodRequest.updateOne({ _id: request._id }, {
+            $addToSet: { responses: { $each: donorIds.map((id) => ({ donorId: id, status: 'pending' })) } },
+            $set: { broadcastAt: new Date() }
+        });
+        const io = req.app.get('socketio');
+        await notifyMany(io, donorIds, {
+            type: 'request',
+            title: 'Emergency blood broadcast',
+            message: `${request.bloodGroup} blood urgently needed at ${request.hospitalName} (${request.bagsRequired} bag(s)).`,
+            link: '/requests'
+        });
+        if (io) {
+            donorIds.forEach((id) => io.to(`user:${id}`).emit('blood_request_received', { _id: request._id, bloodGroup: request.bloodGroup, hospitalName: request.hospitalName, bagsRequired: request.bagsRequired }));
+            io.emit('blood_request_changed', { type: 'broadcast', requestId: request._id });
+        }
+        res.json({ success: true, message: `Broadcast sent to ${donorIds.length} donor(s)`, reached: donorIds.length });
+    } catch (error) {
+        return fail(res, 'Broadcast failed', error);
+    }
+};
+
+// manual escalation — 30 min wait na kore recipient nijei next tier donor-ke notify korte pare.
+const escalateRequestNow = async (req, res) => {
+    try {
+        if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ success: false, message: 'Invalid request id' });
+        const request = await BloodRequest.findOne({ _id: req.params.id, recipientId: req.user.id }).lean();
+        if (!request) return res.status(404).json({ success: false, message: 'Request not found' });
+        if (request.status !== 'pending') return res.status(400).json({ success: false, message: 'Only pending requests can be escalated' });
+        if (request.escalationLevel >= 3) return res.status(400).json({ success: false, message: 'Maximum escalation level reached' });
+        const io = req.app.get('socketio');
+        const level = await escalateRequest(io, request);
+        res.json({ success: true, message: level ? `Escalated to level ${level}` : 'No new donors found for escalation', level });
+    } catch (error) {
+        return fail(res, 'Escalation failed', error);
+    }
+};
+
+module.exports = { createBloodRequest, getAllRequests, getMyRequests, getMyEmergencyRequests, getMyDirectRequests, getIncomingDirectRequests, getIncomingEmergencyRequests, respondToRequest, cancelRequest, updateRequest, deleteRequest, getSharedRequest, broadcastRequest, escalateRequestNow, validCoordinates };

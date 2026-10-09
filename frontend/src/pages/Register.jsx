@@ -25,7 +25,7 @@ export default function Register() {
     if (!formData.division || !formData.district || !formData.thana || !formData.city) return setErrorMsg('Please complete Division, District, Thana and City/Area.');
     if (formData.isAvailable && (!formData.age || !formData.weight)) return setErrorMsg('Age and weight are required when registering as an available donor.');
     setLoading(true);
-    try { await axios.post(`${API_URL}/api/auth/register`, formData); setSuccessMsg('Registration successful. Redirecting to login...'); setTimeout(() => navigate('/login'), 1200); }
+    try { await axios.post(`${API_URL}/api/auth/register`, formData); setSuccessMsg('Registration successful. Log in to verify your phone/email and finish your profile.'); setTimeout(() => navigate('/login'), 1500); }
     catch (err) { setErrorMsg(err.response?.data?.message || 'Registration failed.'); } finally { setLoading(false); }
   };
 

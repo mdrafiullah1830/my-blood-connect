@@ -10,7 +10,7 @@ const safeUser = (user) => ({
     name: user.name,
     email: user.email,
     phone: user.phone,
-    role: 'user',
+    role: user.role === 'admin' ? 'admin' : 'user',
     bloodGroup: user.bloodGroup,
     age: user.age,
     weight: user.weight,
@@ -20,6 +20,18 @@ const safeUser = (user) => ({
     city: user.city,
     nidDocument: user.nidDocument,
     birthCertificateDocument: user.birthCertificateDocument,
+    avatar: user.avatar || '',
+    verified: Boolean(user.verified),
+    emailVerified: Boolean(user.emailVerified),
+    phoneVerified: Boolean(user.phoneVerified),
+    twoFactorEnabled: Boolean(user.twoFactorEnabled),
+    preferredLanguage: user.preferredLanguage || 'en',
+    health: user.health || {},
+    availabilitySlots: user.availabilitySlots || [],
+    donationCount: user.donationCount || 0,
+    rating: user.ratingCount ? Number((user.ratingSum / user.ratingCount).toFixed(1)) : 0,
+    ratingCount: user.ratingCount || 0,
+    shareLiveLocation: Boolean(user.shareLiveLocation),
     location: user.location,
     locationUpdatedAt: user.locationUpdatedAt,
     locationAccuracy: user.locationAccuracy,
@@ -82,10 +94,16 @@ const registerUser = async (req, res) => {
         }
         const hashedPassword = await bcrypt.hash(password, 12);
 
+        // age/weight optional — empty/missing/invalid hole null, jate NaN cast error na hoy.
+        const optionalNumber = (value) => {
+            if (value === undefined || value === null || value === '') return null;
+            const parsed = Number(value);
+            return Number.isFinite(parsed) ? parsed : null;
+        };
         const userData = {
             name: String(name).trim(), email: normalizedEmail, password: hashedPassword,
-            phone: normalizedPhone, role: 'user', bloodGroup, age: age === '' ? null : Number(age),
-            weight: weight === '' ? null : Number(weight), division, district, thana, city: String(city).trim(),
+            phone: normalizedPhone, role: 'user', bloodGroup, age: optionalNumber(age),
+            weight: optionalNumber(weight), division, district, thana, city: String(city).trim(),
             nidDocument: nidDocument || '', birthCertificateDocument: birthCertificateDocument || '',
             isAvailable:wantsToBeAvailable
         };
@@ -122,9 +140,17 @@ const loginUser = async (req, res) => {
             await user.save();
         }
 
-        if (user.role !== 'user') { user.role = 'user'; await user.save(); }
+        if (user.role !== 'user' && user.role !== 'admin') { user.role = 'user'; await user.save(); }
+        // 2FA enabled hole password valid holeo token deya hoy na — OTP challenge return hoy.
+        if (user.twoFactorEnabled) {
+            const security = require('./authSecurityController');
+            const challenge = await security.beginLogin2FA(user.email);
+            if (challenge) return res.json({ success: true, requires2FA: true, challenge: challenge.challenge, message: 'Two-factor code sent to your email' });
+        }
         const token = jwt.sign({ id: user._id.toString() }, process.env.JWT_SECRET, { expiresIn: '7d' });
-        res.json({ success: true, token, user: safeUser(user) });
+        const security = require('./authSecurityController');
+        const refreshToken = await security.issueRefreshToken(user._id, { ip: req.ip });
+        res.json({ success: true, token, refreshToken, user: safeUser(user) });
     } catch (error) {
         return sendServerError(res, 'Login failed', error);
     }
@@ -146,16 +172,56 @@ const getProfile = async (req, res) => {
 // donor profile update, blood group change, address change, donation history update er somoy ei section kaj kore.
 const updateProfile = async (req, res) => {
     try {
-        const allowed = ['name', 'phone', 'bloodGroup', 'age', 'weight', 'division', 'district', 'thana', 'city', 'nidDocument', 'birthCertificateDocument', 'lastDonationDate'];
+        const allowed = ['name', 'phone', 'bloodGroup', 'age', 'weight', 'division', 'district', 'thana', 'city', 'nidDocument', 'birthCertificateDocument', 'lastDonationDate', 'avatar', 'preferredLanguage', 'shareLiveLocation'];
         const updates = {};
         allowed.forEach((key) => {
             if (req.body[key] !== undefined) updates[key] = req.body[key];
         });
 
+        // health details (hemoglobin, diseases, medications) — nested validate kore update.
+        if (req.body.health !== undefined) {
+            const health = req.body.health || {};
+            const hemoglobin = health.hemoglobin === '' || health.hemoglobin === null || health.hemoglobin === undefined ? null : Number(health.hemoglobin);
+            if (hemoglobin !== null && (!Number.isFinite(hemoglobin) || hemoglobin < 0 || hemoglobin > 30)) {
+                return res.status(400).json({ success: false, message: 'Hemoglobin must be between 0 and 30 g/dL' });
+            }
+            updates.health = {
+                hemoglobin,
+                diseases: Array.isArray(health.diseases) ? health.diseases.map((d) => String(d).slice(0, 60)).slice(0, 20) : [],
+                medications: Array.isArray(health.medications) ? health.medications.map((m) => String(m).slice(0, 60)).slice(0, 20) : [],
+                lastCheckupDate: health.lastCheckupDate ? new Date(health.lastCheckupDate) : null
+            };
+        }
+
+        // weekly availability calendar slots.
+        if (req.body.availabilitySlots !== undefined) {
+            const slots = Array.isArray(req.body.availabilitySlots) ? req.body.availabilitySlots : [];
+            const validDays = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+            const timePattern = /^([01]\d|2[0-3]):[0-5]\d$/;
+            const valid = slots.every((slot) => validDays.includes(slot?.day) && timePattern.test(String(slot?.from || '')) && timePattern.test(String(slot?.to || '')));
+            if (!valid) return res.status(400).json({ success: false, message: 'Each availability slot needs a valid day and HH:MM from/to time' });
+            updates.availabilitySlots = slots.slice(0, 14);
+        }
+
+        if (updates.avatar !== undefined) {
+            const avatar = String(updates.avatar || '').trim();
+            // data URL (base64 image) ba https URL accept hoy — size limit 400KB.
+            const isDataUrl = avatar.startsWith('data:image/');
+            const isHttps = avatar.startsWith('https://');
+            if (avatar && !isDataUrl && !isHttps) return res.status(400).json({ success: false, message: 'Avatar must be an https URL or an image data URL' });
+            if (isDataUrl && avatar.length > 400 * 1024) return res.status(400).json({ success: false, message: 'Avatar image must be under 400KB' });
+            updates.avatar = avatar;
+        }
+        if (updates.preferredLanguage !== undefined && !['en', 'bn'].includes(updates.preferredLanguage)) {
+            return res.status(400).json({ success: false, message: 'Language must be en or bn' });
+        }
+        if (updates.shareLiveLocation !== undefined) updates.shareLiveLocation = Boolean(updates.shareLiveLocation);
+
         if (updates.phone) {
             updates.phone = String(updates.phone).trim();
             const duplicate = await User.findOne({ phone: updates.phone, _id: { $ne: req.user.id } });
             if (duplicate) return res.status(409).json({ success: false, message: 'Phone number already exists' });
+            updates.phoneVerified = false;
         }
         if (updates.age !== undefined) updates.age = updates.age === '' ? null : Number(updates.age);
         if (updates.weight !== undefined) updates.weight = updates.weight === '' ? null : Number(updates.weight);
